@@ -416,9 +416,11 @@ class HistogramTab(tk.Frame):
         self._ads:    WaveFormsADS | None = None
         self._q:      queue.Queue  = queue.Queue(maxsize=200)
         self._heights: list[float] = []
+        self._last_waveform: np.ndarray | None = None
         self._running = False
         self._csv_file = None
         self._csv_writer = None
+        self._pulse_redraw_pending = False
         self._build()
 
     # ── Layout ─────────────────────────────────────────────────────────────
@@ -488,23 +490,37 @@ class HistogramTab(tk.Frame):
         tk.Label(left, textvariable=self._count_var,
                  bg=BG, fg=YELLOW, font=SANS_B).pack(pady=4)
 
-        # ── Right panel (plot) ──
+        # ── Right panel (two plots) ──
         right = tk.Frame(self, bg=BG)
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
-        right.rowconfigure(0, weight=1)
+        right.rowconfigure(0, weight=3)
+        right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        self._fig, self._ax = plt.subplots(figsize=(8, 5))
+        # Histogram figure
+        self._fig, self._ax = plt.subplots(figsize=(8, 4))
         self._fig.patch.set_facecolor(BG)
         self._ax.set_facecolor(PANEL)
         self._ax.set_xlabel("Pulse Height (V)", color=FG)
         self._ax.set_ylabel("Counts", color=FG)
         self._ax.set_title("Pulse-Height Histogram", color=ACCENT)
         self._ax.grid(True)
-
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self._canvas.draw()
+
+        # Last-pulse waveform figure
+        self._pfig, self._pax = plt.subplots(figsize=(8, 2))
+        self._pfig.patch.set_facecolor(BG)
+        self._pfig.subplots_adjust(left=0.08, right=0.97, top=0.82, bottom=0.22)
+        self._pax.set_facecolor(PANEL)
+        self._pax.set_xlabel("Time (μs)", color=FG)
+        self._pax.set_ylabel("V", color=FG)
+        self._pax.set_title("Most Recent Pulse", color=ACCENT)
+        self._pax.grid(True)
+        self._pcanvas = FigureCanvasTkAgg(self._pfig, master=right)
+        self._pcanvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        self._pcanvas.draw()
 
     # ── File browse ────────────────────────────────────────────────────────
 
@@ -592,6 +608,7 @@ class HistogramTab(tk.Frame):
         self._stop_btn.configure(state="normal")
         self._status.set("Histogram running …")
         self._poll()
+        self._schedule_pulse_redraw()
 
     def _stop(self):
         self._running = False
@@ -634,6 +651,7 @@ class HistogramTab(tk.Frame):
             # Find peak
             peak = float(np.max(np.abs(item)))
             self._heights.append(peak)
+            self._last_waveform = item          # store for waveform viewer
             if self._csv_writer:
                 ts = datetime.datetime.now().isoformat(timespec="milliseconds")
                 self._csv_writer.writerow([ts, f"{peak:.6f}"])
@@ -647,6 +665,28 @@ class HistogramTab(tk.Frame):
             self._redraw()
 
         self.after(80, self._poll)
+
+    def _schedule_pulse_redraw(self):
+        """Throttled waveform refresh — fires every 500 ms while running."""
+        self._redraw_pulse()
+        if self._running:
+            self.after(500, self._schedule_pulse_redraw)
+
+    def _redraw_pulse(self):
+        self._pax.cla()
+        self._pax.set_facecolor(PANEL)
+        self._pax.set_xlabel("Time (μs)", color=FG)
+        self._pax.set_ylabel("V", color=FG)
+        self._pax.set_title("Most Recent Pulse", color=ACCENT)
+        self._pax.grid(True)
+        if self._last_waveform is not None and hasattr(self, "_params"):
+            fs = self._params["sample_rate"]
+            t  = np.linspace(0, len(self._last_waveform) / fs * 1e6,
+                             len(self._last_waveform))
+            self._pax.plot(t, self._last_waveform, color=GREEN, lw=1.2)
+            self._pax.axhline(self._params["trigger_level"], color=RED,
+                              lw=0.8, linestyle="--", alpha=0.7)
+        self._pcanvas.draw_idle()
 
     def _redraw(self):
         self._ax.cla()
@@ -721,10 +761,10 @@ class PulseHeightAnalyzer(tk.Tk):
         nb.pack(fill="both", expand=True, padx=4, pady=4)
 
         self._scope_tab = ScopeTab(nb, self._status)
-        nb.add(self._scope_tab, text="  Scope View  ")
+        nb.add(self._scope_tab, text="  🔭  Scope View  ")
 
         self._hist_tab = HistogramTab(nb, self._status)
-        nb.add(self._hist_tab, text="  Pulse Height Histogram  ")
+        nb.add(self._hist_tab, text="  📊  Pulse Height Histogram  ")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
