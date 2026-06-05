@@ -383,6 +383,7 @@ class ScopeTab(tk.Frame):
         self._status.set(f"Scope: {n} trace{'s' if n != 1 else ''} shown")
 
     def _redraw(self, traces):
+        p = self._params
         y_range = p["y_range"]
         time_base = p["time_base_us"]
         DIVS = 5
