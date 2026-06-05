@@ -388,8 +388,8 @@ class ScopeTab(tk.Frame):
         time_base = p["time_base_us"]
         DIVS = 5
         self._ax.cla()
-        self._ax.set_xlim(-time_base*DIVS/2, time_base*DIVS/2)
-        self._ax.set_ylim(-y_range*DIVS/2, y_range*DIVS/2)
+        self._ax.set_xlim(-time_base*DIVS, time_base*DIVS)
+        self._ax.set_ylim(-y_range*DIVS, y_range*DIVS)
         self._ax.set_facecolor(PANEL)
         self._ax.set_xlabel("Time (μs)", color=FG)
         self._ax.set_ylabel("Voltage (V)", color=FG)
@@ -693,8 +693,8 @@ class HistogramTab(tk.Frame):
         time_base = p["time_base_us"]
         DIVS = 5
         self._pax.cla()
-        self._pax.set_xlim(-time_base*DIVS/2, time_base*DIVS/2)
-        self._pax.set_ylim(-y_range*DIVS/2, y_range*DIVS/2)
+        self._pax.set_xlim(-time_base*DIVS, time_base*DIVS)
+        self._pax.set_ylim(-y_range*DIVS, y_range*DIVS)
         self._pax.set_facecolor(PANEL)
         self._pax.set_xlabel("Time (μs)", color=FG)
         self._pax.set_ylabel("V", color=FG)
@@ -702,8 +702,8 @@ class HistogramTab(tk.Frame):
         self._pax.grid(True)
         if self._last_waveform is not None:
             fs = p["sample_rate"]
-            t  = np.linspace(-len(self._last_waveform) / (2 * fs) * 1e6, 
-                             len(self._last_waveform) / (2 * fs) * 1e6,
+            t  = np.linspace(-len(self._last_waveform) / (2*fs) * 1e6, 
+                             len(self._last_waveform) / (2*fs) * 1e6,
                              len(self._last_waveform))
             self._pax.plot(t, self._last_waveform, color=GREEN, lw=1.2)
             self._pax.axhline(p["trigger_level"], color=RED,
