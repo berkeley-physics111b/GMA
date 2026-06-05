@@ -247,7 +247,6 @@ class AcqWorker:
 # ---------------------------------------------------------------------------
 
 class ScopeTab(tk.Frame):
-    MAX_TRACES = 5   # number of recent pulses to overlay
 
     def __init__(self, parent, status_var: tk.StringVar, **kw):
         super().__init__(parent, bg=BG, **kw)
@@ -329,6 +328,7 @@ class ScopeTab(tk.Frame):
             return
 
         self._params = self.scope_settings.get_params()
+        self._max_traces = self.pulses_display.get()
         self._q      = queue.Queue(maxsize=20)
         self._worker = AcqWorker(self._ads, self._params, self._q)
         self._worker.start()
@@ -374,16 +374,21 @@ class ScopeTab(tk.Frame):
     def _add_trace(self, data: np.ndarray):
         p  = self._params
         fs = p["sample_rate"]
-        t  = np.linspace(0, len(data) / fs * 1e6, len(data))   # μs
+        t  = np.linspace(-len(data) / (2 * fs) * 1e6, len(data) / (2 * fs) * 1e6, len(data))   # centered on zero, μs
         self._traces.append((t, data))
-        if len(self._traces) > self.MAX_TRACES:
+        if len(self._traces) > self._max_traces:
             self._traces.pop(0)
         self._redraw(self._traces)
         n = len(self._traces)
         self._status.set(f"Scope: {n} trace{'s' if n != 1 else ''} shown")
 
     def _redraw(self, traces):
+        y_range = p["y_range"]
+        time_base = p["time_base_us"]
+        DIVS = 5
         self._ax.cla()
+        self._ax.set_xlim(-time_base*DIVS/2, time_base*DIVS/2)
+        self._ax.set_ylim(-y_range*DIVS/2, y_range*DIVS/2)
         self._ax.set_facecolor(PANEL)
         self._ax.set_xlabel("Time (μs)", color=FG)
         self._ax.set_ylabel("Voltage (V)", color=FG)
@@ -682,18 +687,25 @@ class HistogramTab(tk.Frame):
             self.after(500, self._schedule_pulse_redraw)
 
     def _redraw_pulse(self):
+        p = self._params
+        y_range = p["y_range"]
+        time_base = p["time_base_us"]
+        DIVS = 5
         self._pax.cla()
+        self._pax.set_xlim(-time_base*DIVS/2, time_base*DIVS/2)
+        self._pax.set_ylim(-y_range*DIVS/2, y_range*DIVS/2)
         self._pax.set_facecolor(PANEL)
         self._pax.set_xlabel("Time (μs)", color=FG)
         self._pax.set_ylabel("V", color=FG)
         self._pax.set_title("Most Recent Pulse", color=ACCENT)
         self._pax.grid(True)
-        if self._last_waveform is not None and hasattr(self, "_params"):
-            fs = self._params["sample_rate"]
-            t  = np.linspace(0, len(self._last_waveform) / fs * 1e6,
+        if self._last_waveform is not None:
+            fs = p["sample_rate"]
+            t  = np.linspace(-len(self._last_waveform) / (2 * fs) * 1e6, 
+                             len(self._last_waveform) / (2 * fs) * 1e6,
                              len(self._last_waveform))
             self._pax.plot(t, self._last_waveform, color=GREEN, lw=1.2)
-            self._pax.axhline(self._params["trigger_level"], color=RED,
+            self._pax.axhline(p["trigger_level"], color=RED,
                               lw=0.8, linestyle="--", alpha=0.7)
         self._pcanvas.draw_idle()
 
