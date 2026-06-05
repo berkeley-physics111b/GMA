@@ -273,6 +273,15 @@ class ScopeTab(tk.Frame):
         self.scope_settings = ScopeSettingsPanel(left)
         self.scope_settings.pack(fill="x", padx=4, pady=4)
 
+        trace_frm = tk.LabelFrame(left, text="Trace Viewer Settings",
+                                 bg=PANEL, fg=ACCENT, font=SANS_B)
+        trace_frm.pack(fill="x", padx=4, pady=4)
+        trace_frm.columnconfigure(1, weight=1)
+
+        self.pulses_display = tk.IntVar(value=5)
+        _lf(trace_frm, "Number of pulses to display", col=0, row=0)
+        _ef(trace_frm, self.pulses_display, col=1, row=0, width=5)
+
         ctrl = tk.Frame(left, bg=BG)
         ctrl.pack(fill="x", padx=4, pady=4)
         ctrl.columnconfigure(0, weight=1)
