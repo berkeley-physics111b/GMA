@@ -231,8 +231,6 @@ class AcqWorker:
                     auto_timeout_s=0.0,
                     timeout_s=3.0,#initial guess at this value - GMA pulses pretty frequent
                 )
-                if invert:
-                    data = -data
                 self._q.put(data)
             except TimeoutError:
                 # No trigger – just retry
@@ -664,7 +662,7 @@ class HistogramTab(tk.Frame):
                 self._stop()
                 return
             # Find peak
-            peak = float(np.max(np.abs(item)))
+            peak = float(np.max(item)) # subtract noise floor?
             self._heights.append(peak)
             self._last_waveform = item          # store for waveform viewer
             if self._csv_writer:
@@ -783,10 +781,10 @@ class PulseHeightAnalyzer(tk.Tk):
         nb.pack(fill="both", expand=True, padx=4, pady=4)
 
         self._scope_tab = ScopeTab(nb, self._status)
-        nb.add(self._scope_tab, text="  🔭  Scope View  ")
+        nb.add(self._scope_tab, text="  Scope View  ")
 
         self._hist_tab = HistogramTab(nb, self._status)
-        nb.add(self._hist_tab, text="  📊  Pulse Height Histogram  ")
+        nb.add(self._hist_tab, text="  Pulse Height Histogram  ")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
