@@ -134,18 +134,18 @@ class ScopeSettingsPanel(tk.LabelFrame):
         self.trig_level   = tk.DoubleVar(value=0.15)
         self.edge         = tk.StringVar(value="Rise")
         self.sample_freq  = tk.DoubleVar(value=1e6)
-        self.y_range      = tk.DoubleVar(value=0.5)
+        self.y_range      = tk.DoubleVar(value=2.5)
         self.y_offset     = tk.DoubleVar(value=0.0)
-        self.time_base_us = tk.DoubleVar(value=1.0)
+        self.time_base_us = tk.DoubleVar(value=5.0)
         self.probe_invert = tk.BooleanVar(value=False)
 
         rows = [
             ("Channel (0-based):",   self.channel,      5),
             ("Trigger Level (V):",   self.trig_level,   8),
             ("Sample Freq (Hz):",    self.sample_freq,  12),
-            ("Y Range (V/div):",     self.y_range,      8),
+            ("Y Range (V Pk to Pk):",self.y_range,      8),
             ("Vertical Offset (V):", self.y_offset,     8),
-            ("Time Base (μs/div):",  self.time_base_us, 8),
+            ("Time Base (μs):",      self.time_base_us, 8),
         ]
         for r, (label, var, width) in enumerate(rows):
             _lf(self, label, col=0, row=r)
@@ -384,10 +384,9 @@ class ScopeTab(tk.Frame):
         p = self._params
         y_range = p["y_range"]
         time_base = p["time_base_us"]
-        DIVS = 5
         self._ax.cla()
-        self._ax.set_xlim(-time_base*DIVS, time_base*DIVS)
-        self._ax.set_ylim(-y_range*DIVS, y_range*DIVS)
+        self._ax.set_xlim(-time_base / 2, time_base / 2)
+        self._ax.set_ylim(-y_range / 2, y_range / 2)
         self._ax.set_facecolor(PANEL)
         self._ax.set_xlabel("Time (μs)", color=FG)
         self._ax.set_ylabel("Voltage (V)", color=FG)
@@ -689,10 +688,9 @@ class HistogramTab(tk.Frame):
         p = self._params
         y_range = p["y_range"]
         time_base = p["time_base_us"]
-        DIVS = 5
         self._pax.cla()
-        self._pax.set_xlim(-time_base*DIVS, time_base*DIVS)
-        self._pax.set_ylim(-y_range*DIVS, y_range*DIVS)
+        self._pax.set_xlim(-time_base / 2, time_base / 2)
+        self._pax.set_ylim(-y_range / 2, y_range / 2)
         self._pax.set_facecolor(PANEL)
         self._pax.set_xlabel("Time (μs)", color=FG)
         self._pax.set_ylabel("V", color=FG)
