@@ -416,6 +416,15 @@ class WaveFormsADS:
             ),
             "FDwfAnalogInChannelOffsetSet",
         )
+    
+    def analog_in_set_attenuation(self, channel: int, attenuation: float) -> None:
+        """Set the channel attenuation as a unitless scaling factor."""
+        self._check(
+            self._dwf.FDwfAnalogInChannelAttenuationSet(
+                self._hdwf, channel, ctypes.c_double(attenuation)
+            ),
+            "FDwfAnalogInChannelAttenuationSet",
+        )
 
     def analog_in_set_coupling(self, channel: int, coupling: int = DwfAnalogCouplingDC) -> None:
         """Set channel coupling: DwfAnalogCouplingDC (0) or DwfAnalogCouplingAC (1)."""
@@ -544,6 +553,7 @@ class WaveFormsADS:
         channel: int = 0,
         sample_rate_hz: float = 1e6,
         buffer_size: int = 4096,
+        attenuation: float = 1.0,
         trigger_level_v: Optional[float] = None,
         trigger_channel: Optional[int] = None,
         trigger_condition: int = DwfTriggerSlopeRise,
@@ -561,6 +571,8 @@ class WaveFormsADS:
             ADC sample rate in Hz.
         buffer_size : int
             Number of samples to capture.
+        attenuation : float
+            Attenuation of signal (effectively multiplier).
         trigger_level_v : float or None
             Trigger voltage level.  If None, no hardware trigger is set
             (free-run / auto-trigger only).
@@ -583,6 +595,7 @@ class WaveFormsADS:
         self.analog_in_set_buffer_size(buffer_size)
         self.analog_in_set_acquisition_mode(acqmodeSingle)
         self.analog_in_channel_enable(channel)
+        self.analog_in_set_attenuation(channel=channel, attenuation=attenuation)
 
         if trigger_level_v is not None:
             trig_ch = channel if trigger_channel is None else trigger_channel

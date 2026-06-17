@@ -181,19 +181,87 @@ class ScopeSettingsPanel(tk.LabelFrame):
 
 
 # ---------------------------------------------------------------------------
+# Shared signal processing settings panel
+# ---------------------------------------------------------------------------
+
+class SignalProcessingSettings(tk.LabelFrame):
+    """Reusable panel for signal processing settings - filtering, background subtraction."""
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, text="Signal Processing Settings",
+                         bg=PANEL, fg=ACCENT, font=SANS_B, **kw)
+        self._build()
+
+    def _build(self):
+        self.apply_baseline = tk.BooleanVar(value=False)
+        self.size = tk.DoubleVar(value=100)
+        self.position = tk.DoubleVar(value=100)
+        self.max_noise_percent = tk.DoubleVar(value=2)
+
+        self.apply_slope_max = tk.BooleanVar(value=False)
+        self.max_slope_percent = tk.DoubleVar(value=2)
+
+        #self.apply_filter_signal = tk.BooleanVar(value=False)
+        #self.low_pass_cutoff = tk.DoubleVar(value=1e6)
+        #self.high_pass_cutoff = tk.DoubleVar(value=0)
+
+        tk.Checkbutton(self, text="Apply baseline", variable=self.apply_baseline,
+                       bg=PANEL, fg=FG, selectcolor=ENTRY_BG,
+                       activebackground=PANEL, font=SANS).grid(
+                       column=0, row=0, columnspan=2, sticky="w", padx=PADX, pady=PADY)
+
+        rows = [
+            ("Size (μs):",                   self.size,                8),
+            ("Position (μs):",               self.position,            8),
+            ("Max noise (%):",               self.max_noise_percent,   8),
+        ]
+        for r, (label, var, width) in enumerate(rows):
+            _lf(self, label, col=0, row=r+1)
+            _ef(self, var, col=1, row=r+1, width=width)
+
+        r = len(rows) + 1
+        tk.Checkbutton(self, text="Apply max slope", variable=self.apply_slope_max,
+                       bg=PANEL, fg=FG, selectcolor=ENTRY_BG,
+                       activebackground=PANEL, font=SANS).grid(
+            column=0, row=r, columnspan=2, sticky="w", padx=PADX, pady=PADY)
+
+        r += 1
+        _lf(self, "Max slope (%):", col=0, row=r)
+        _ef(self, self.max_slope_percent, col=1, row=r, width=8)
+
+    def get_params(self):
+        size = float(self.size.get()) / 1e6
+        position = float(self.position.get()) / 1e6
+        max_noise_percent = max(0, min(float(self.max_noise_percent.get()), 100))
+        self.max_noise_percent.set(max_noise_percent)
+        max_slope_percent = max(0, min(float(self.max_slope_percent.get()), 100))
+        self.max_slope_percent.set(max_slope_percent)
+        
+        return dict(
+            apply_baseline=self.apply_baseline.get(),
+            size=size,
+            position=position,
+            max_noise_percent=max_noise_percent,
+            apply_slope_max=self.apply_slope_max.get(),
+            max_slope_percent=max_slope_percent
+        )
+
+
+# ---------------------------------------------------------------------------
 # Acquisition worker (runs in a background thread)
 # ---------------------------------------------------------------------------
 
 class AcqWorker:
     """
-    Background thread that calls analog_in_capture in a loop and posts
-    results to a queue.  Stopped gracefully via stop().
+    Background thread that calls analog_in_capture in a loop, applies 
+    signal processing configuration, and posts results to a queue.
     """
 
-    def __init__(self, ads: WaveFormsADS, params: dict,
+    def __init__(self, ads: WaveFormsADS, params: dict, signal_params: dict,
                  result_q: queue.Queue):
         self._ads    = ads
         self._params = params
+        self._sig_p  = signal_params
         self._q      = result_q
         self._stop   = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -206,14 +274,15 @@ class AcqWorker:
 
     def _run(self):
         p = self._params
+        s = self._sig_p
         ch    = p["channel"]
         fs    = p["sample_rate"]
         buf   = p["buffer_size"]
         trig  = p["trigger_level"]
         slope = p["slope"]
         invert = p["invert"]
+        attenuation = -1.0 if invert else 1.0
 
-        # Range / offset are set once (ADS methods called directly)
         try:
             self._ads.analog_in_set_range(ch, p["y_range"])
             self._ads.analog_in_set_offset(ch, p["y_offset"])
@@ -222,18 +291,61 @@ class AcqWorker:
 
         while not self._stop.is_set():
             try:
-                data = self._ads.analog_in_capture(
+                trace = self._ads.analog_in_capture(
                     channel=ch,
                     sample_rate_hz=fs,
                     buffer_size=buf,
+                    attenuation=attenuation,
                     trigger_level_v=trig,
                     trigger_condition=slope,
                     auto_timeout_s=0.0,
-                    timeout_s=3.0,#initial guess at this value - GMA pulses pretty frequent
+                    timeout_s=3.0,
                 )
-                self._q.put(data)
+                
+                # --- Background Signal Processing ---
+                if s["apply_baseline"]:
+                    max_val = np.max(trace)
+                    if max_val == 0:
+                        max_val = 1e-6  # Prevent division by zero
+                        
+                    max_index = np.argmax(trace)
+                    stop_index = max(int(max_index - (s["position"] * fs)), 0)
+                    start_index = max(int(stop_index - (s["size"] * fs)), 0)
+                    
+                    if start_index >= stop_index:
+                        continue  # Not enough data points to compute baseline; reject event
+                        
+                    noise = np.std(trace[start_index:stop_index])
+
+                    # Scale raw fraction to percentages for dynamic UI fields
+                    if (noise / max_val) > (s["max_noise_percent"] / 100.0):
+                        continue  # Rejected due to excessive noise
+                    
+                    mid_index = start_index + (stop_index - start_index) // 2
+                    baseline_section_one = trace[start_index:mid_index]
+                    if len(baseline_section_one) == 0:
+                        continue
+                    y_offset = np.mean(baseline_section_one)
+                    
+                    baseline_section_two = trace[mid_index:stop_index]
+                    if len(baseline_section_two) == 0:
+                        continue
+                        
+                    denom = stop_index - start_index
+                    slope_val = (np.mean(baseline_section_two) - y_offset) / denom if denom != 0 else 0
+
+                    if s["apply_slope_max"]:
+                        if (slope_val / max_val) > (s["max_slope_percent"] / 100.0):
+                            continue  # Rejected due to baseline drift slope limit
+                    
+                    # Apply baseline correction across whole trace
+                    time_indices = np.arange(len(trace))
+                    true_baseline = slope_val * (time_indices - start_index) + y_offset
+                    trace = trace - true_baseline
+                
+                self._q.put(trace)
+                
             except TimeoutError:
-                # No trigger – just retry
                 pass
             except Exception as exc:
                 self._q.put(exc)
@@ -256,19 +368,19 @@ class ScopeTab(tk.Frame):
         self._running = False
         self._build()
 
-    # ── Layout ─────────────────────────────────────────────────────────────
-
     def _build(self):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # ── Left panel (settings) ──
         left_scroll = ScrollableFrame(self, bg=BG, width=310)
         left_scroll.grid(row=0, column=0, sticky="ns", padx=(4, 0), pady=4)
         left = left_scroll.inner
 
         self.scope_settings = ScopeSettingsPanel(left)
         self.scope_settings.pack(fill="x", padx=4, pady=4)
+
+        self.signal_processing_settings = SignalProcessingSettings(left)
+        self.signal_processing_settings.pack(fill="x", padx=4, pady=4)
 
         trace_frm = tk.LabelFrame(left, text="Trace Viewer Settings",
                                  bg=PANEL, fg=ACCENT, font=SANS_B)
@@ -284,16 +396,12 @@ class ScopeTab(tk.Frame):
         ctrl.columnconfigure(0, weight=1)
         ctrl.columnconfigure(1, weight=1)
 
-        self._start_btn = _btn(ctrl, "▶  Start", self._start,
-                               col=0, row=0, fg=BG, bg=GREEN)
-        self._stop_btn  = _btn(ctrl, "■  Stop",  self._stop,
-                               col=1, row=0, fg=BG, bg=RED)
+        self._start_btn = _btn(ctrl, "▶  Start", self._start, col=0, row=0, fg=BG, bg=GREEN)
+        self._stop_btn  = _btn(ctrl, "■  Stop",  self._stop, col=1, row=0, fg=BG, bg=RED)
         self._stop_btn.configure(state="disabled")
 
-        _btn(ctrl, "Clear Traces", self._clear_traces,
-             col=0, row=1, colspan=2)
+        _btn(ctrl, "Clear Traces", self._clear_traces, col=0, row=1, colspan=2)
 
-        # ── Right panel (plot) ──
         right = tk.Frame(self, bg=BG)
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
         right.rowconfigure(0, weight=1)
@@ -311,10 +419,7 @@ class ScopeTab(tk.Frame):
         self._canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self._canvas.draw()
 
-        # Colour cycle for traces
         self._colors = [ACCENT, GREEN, YELLOW, PURPLE, RED]
-
-    # ── Control ────────────────────────────────────────────────────────────
 
     def _start(self):
         if self._running:
@@ -326,9 +431,10 @@ class ScopeTab(tk.Frame):
             return
 
         self._params = self.scope_settings.get_params()
+        self._signal_params = self.signal_processing_settings.get_params()
         self._max_traces = self.pulses_display.get()
         self._q      = queue.Queue(maxsize=20)
-        self._worker = AcqWorker(self._ads, self._params, self._q)
+        self._worker = AcqWorker(self._ads, self._params, self._signal_params, self._q)
         self._worker.start()
         self._running = True
         self._start_btn.configure(state="disabled")
@@ -353,8 +459,6 @@ class ScopeTab(tk.Frame):
         self._traces.clear()
         self._redraw([])
 
-    # ── Poll & draw ────────────────────────────────────────────────────────
-
     def _poll(self):
         if not self._running:
             return
@@ -372,7 +476,7 @@ class ScopeTab(tk.Frame):
     def _add_trace(self, data: np.ndarray):
         p  = self._params
         fs = p["sample_rate"]
-        t  = np.linspace(-len(data) / (2 * fs) * 1e6, len(data) / (2 * fs) * 1e6, len(data))   # centered on zero, μs
+        t  = np.linspace(-len(data) / (2 * fs) * 1e6, len(data) / (2 * fs) * 1e6, len(data))
         self._traces.append((t, data))
         if len(self._traces) > self._max_traces:
             self._traces.pop(0)
@@ -394,21 +498,17 @@ class ScopeTab(tk.Frame):
         self._ax.grid(True)
 
         if traces:
-            p = self._params
             for i, (t, d) in enumerate(traces):
                 alpha = 0.4 + 0.6 * (i + 1) / len(traces)
                 self._ax.plot(t, d, color=self._colors[i % len(self._colors)],
                               lw=1.2, alpha=alpha,
                               label=f"T-{len(traces)-i}")
-            # Trigger line
             self._ax.axhline(p["trigger_level"], color=RED, lw=0.8,
                              linestyle="--", alpha=0.7, label="Trigger")
             self._ax.legend(loc="upper right", facecolor=PANEL,
                             labelcolor=FG, fontsize=8, framealpha=0.7)
 
         self._canvas.draw_idle()
-
-    # ── Teardown ───────────────────────────────────────────────────────────
 
     def destroy(self):
         self._stop()
@@ -435,22 +535,20 @@ class HistogramTab(tk.Frame):
         self._pulse_redraw_pending = False
         self._build()
 
-    # ── Layout ─────────────────────────────────────────────────────────────
-
     def _build(self):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # ── Left panel ──
         left_scroll = ScrollableFrame(self, bg=BG, width=310)
         left_scroll.grid(row=0, column=0, sticky="ns", padx=(4, 0), pady=4)
         left = left_scroll.inner
 
-        # Scope settings
         self.scope_settings = ScopeSettingsPanel(left)
         self.scope_settings.pack(fill="x", padx=4, pady=4)
 
-        # Histogram settings
+        self.signal_processing_settings = SignalProcessingSettings(left)
+        self.signal_processing_settings.pack(fill="x", padx=4, pady=4)
+
         hist_frm = tk.LabelFrame(left, text="Histogram Settings",
                                  bg=PANEL, fg=ACCENT, font=SANS_B)
         hist_frm.pack(fill="x", padx=4, pady=4)
@@ -467,7 +565,6 @@ class HistogramTab(tk.Frame):
         _lf(hist_frm, "V min:",     col=0, row=1); _ef(hist_frm, self.v_min,   col=1, row=1, width=8)
         _lf(hist_frm, "V max:",     col=0, row=2); _ef(hist_frm, self.v_max,   col=1, row=2, width=8)
 
-        # File settings
         file_frm = tk.LabelFrame(left, text="Data File",
                                  bg=PANEL, fg=ACCENT, font=SANS_B)
         file_frm.pack(fill="x", padx=4, pady=4)
@@ -482,34 +579,27 @@ class HistogramTab(tk.Frame):
         _btn(file_frm, "Browse / Save As…", self._browse_file, col=0, row=1, colspan=2)
         _btn(file_frm, "Import CSV…", self._import_csv, col=0, row=2, colspan=2)
 
-        # Control buttons
         ctrl = tk.Frame(left, bg=BG)
         ctrl.pack(fill="x", padx=4, pady=4)
         ctrl.columnconfigure(0, weight=1)
         ctrl.columnconfigure(1, weight=1)
 
-        self._start_btn = _btn(ctrl, "▶  Start", self._start,
-                               col=0, row=0, fg=BG, bg=GREEN)
-        self._stop_btn  = _btn(ctrl, "■  Stop",  self._stop,
-                               col=1, row=0, fg=BG, bg=RED)
+        self._start_btn = _btn(ctrl, "▶  Start", self._start, col=0, row=0, fg=BG, bg=GREEN)
+        self._stop_btn  = _btn(ctrl, "■  Stop",  self._stop, col=1, row=0, fg=BG, bg=RED)
         self._stop_btn.configure(state="disabled")
 
-        _btn(ctrl, "Clear Histogram", self._clear_hist,
-             col=0, row=1, colspan=2)
+        _btn(ctrl, "Clear Histogram", self._clear_hist, col=0, row=1, colspan=2)
 
-        # Count label
         self._count_var = tk.StringVar(value="Events: 0")
         tk.Label(left, textvariable=self._count_var,
                  bg=BG, fg=YELLOW, font=SANS_B).pack(pady=4)
 
-        # ── Right panel (two plots) ──
         right = tk.Frame(self, bg=BG)
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
         right.rowconfigure(0, weight=3)
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        # Histogram figure
         self._fig, self._ax = plt.subplots(figsize=(8, 4))
         self._fig.patch.set_facecolor(BG)
         self._ax.set_facecolor(PANEL)
@@ -521,7 +611,6 @@ class HistogramTab(tk.Frame):
         self._canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self._canvas.draw()
 
-        # Last-pulse waveform figure
         self._pfig, self._pax = plt.subplots(figsize=(8, 2))
         self._pfig.patch.set_facecolor(BG)
         self._pfig.subplots_adjust(left=0.08, right=0.97, top=0.82, bottom=0.22)
@@ -533,8 +622,6 @@ class HistogramTab(tk.Frame):
         self._pcanvas = FigureCanvasTkAgg(self._pfig, master=right)
         self._pcanvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
         self._pcanvas.draw()
-
-    # ── File browse ────────────────────────────────────────────────────────
 
     def _browse_file(self):
         path = filedialog.asksaveasfilename(
@@ -557,7 +644,6 @@ class HistogramTab(tk.Frame):
             with open(path, newline="") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
-                # Expect columns: timestamp, pulse_height_V — find height col by name or default to col 1
                 ph_col = 1
                 if header:
                     for i, h in enumerate(header):
@@ -582,8 +668,6 @@ class HistogramTab(tk.Frame):
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
 
-    # ── Control ────────────────────────────────────────────────────────────
-
     def _start(self):
         if self._running:
             return
@@ -593,13 +677,11 @@ class HistogramTab(tk.Frame):
             messagebox.showerror("Device Error", str(exc))
             return
 
-        # Open CSV if a path is given
         path = self.filename.get().strip()
         if path:
             try:
                 self._csv_file   = open(path, "a", newline="")
                 self._csv_writer = csv.writer(self._csv_file)
-                # Write header only if the file is empty / new
                 if self._csv_file.tell() == 0:
                     self._csv_writer.writerow(["timestamp", "pulse_height_V"])
             except Exception as exc:
@@ -612,8 +694,9 @@ class HistogramTab(tk.Frame):
             self._csv_writer = None
 
         self._params = self.scope_settings.get_params()
+        self._signal_params = self.signal_processing_settings.get_params()
         self._q      = queue.Queue(maxsize=200)
-        self._worker = AcqWorker(self._ads, self._params, self._q)
+        self._worker = AcqWorker(self._ads, self._params, self._signal_params, self._q)
         self._worker.start()
         self._running = True
         self._start_btn.configure(state="disabled")
@@ -645,8 +728,6 @@ class HistogramTab(tk.Frame):
         self._count_var.set("Events: 0")
         self._redraw()
 
-    # ── Poll & draw ────────────────────────────────────────────────────────
-
     def _poll(self):
         if not self._running:
             return
@@ -660,10 +741,11 @@ class HistogramTab(tk.Frame):
                 self._status.set(f"Error: {item}")
                 self._stop()
                 return
-            # Find peak
-            peak = float(np.max(item)) # subtract noise floor?
+            
+            # The item payload is baseline-corrected (if checked) inside the worker thread
+            peak = float(np.max(item))
             self._heights.append(peak)
-            self._last_waveform = item          # store for waveform viewer
+            self._last_waveform = item
             if self._csv_writer:
                 ts = datetime.datetime.now().isoformat(timespec="milliseconds")
                 self._csv_writer.writerow([ts, f"{peak:.6f}"])
@@ -679,7 +761,6 @@ class HistogramTab(tk.Frame):
         self.after(80, self._poll)
 
     def _schedule_pulse_redraw(self):
-        """Throttled waveform refresh — fires every 500 ms while running."""
         self._redraw_pulse()
         if self._running:
             self.after(500, self._schedule_pulse_redraw)
@@ -733,8 +814,6 @@ class HistogramTab(tk.Frame):
 
         self._canvas.draw_idle()
 
-    # ── Teardown ───────────────────────────────────────────────────────────
-
     def destroy(self):
         self._stop()
         super().destroy()
@@ -753,7 +832,6 @@ class PulseHeightAnalyzer(tk.Tk):
         self.minsize(1000, 600)
         self.geometry("1280x780")
 
-        # ── ttk style overrides ──
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TNotebook",       background=BG,    borderwidth=0)
@@ -767,14 +845,12 @@ class PulseHeightAnalyzer(tk.Tk):
         style.configure("TScrollbar",      background=PANEL, troughcolor=BG,
                         arrowcolor=FG)
 
-        # ── Status bar ──
         self._status = tk.StringVar(value="Ready")
         status_bar = tk.Label(self, textvariable=self._status,
                               bg=BG, fg=YELLOW, font=MONO, anchor="w",
                               relief="flat")
         status_bar.pack(side="bottom", fill="x", padx=8, pady=2)
 
-        # ── Notebook ──
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=4, pady=4)
 
@@ -792,10 +868,9 @@ class PulseHeightAnalyzer(tk.Tk):
             self._hist_tab._stop()
         except Exception:
             pass
+        self.quit()
         self.destroy()
 
-
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     app = PulseHeightAnalyzer()
