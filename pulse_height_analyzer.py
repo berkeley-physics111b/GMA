@@ -44,7 +44,7 @@ MPL_STYLE = {
     "axes.labelcolor":   FG,
     "xtick.color":       FG,
     "ytick.color":       FG,
-    "text.color":        FG,
+    "text.color":       FG,
     "grid.color":        "#585b70",
     "grid.alpha":        0.4,
     "lines.color":       ACCENT,
@@ -83,13 +83,6 @@ def _btn(parent, text, cmd, col=0, row=0, fg=FG, bg=BUTTON_BG,
     return b
 
 
-def _section(parent, title, row=0, colspan=10):
-    lbl = tk.Label(parent, text=f"  {title}  ", bg=ACCENT, fg=BG, font=SANS_B)
-    lbl.grid(column=0, row=row, columnspan=colspan, sticky="ew",
-             padx=PADX, pady=(10, 2))
-    return lbl
-
-
 # ---------------------------------------------------------------------------
 # Scrollable frame
 # ---------------------------------------------------------------------------
@@ -122,8 +115,6 @@ class ScrollableFrame(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class ScopeSettingsPanel(tk.LabelFrame):
-    """Reusable panel for ADS acquisition parameters."""
-
     def __init__(self, parent, **kw):
         super().__init__(parent, text="Scope / Trigger Settings",
                          bg=PANEL, fg=ACCENT, font=SANS_B, **kw)
@@ -185,8 +176,6 @@ class ScopeSettingsPanel(tk.LabelFrame):
 # ---------------------------------------------------------------------------
 
 class SignalProcessingSettings(tk.LabelFrame):
-    """Reusable panel for signal processing settings - filtering, background subtraction."""
-
     def __init__(self, parent, **kw):
         super().__init__(parent, text="Signal Processing Settings",
                          bg=PANEL, fg=ACCENT, font=SANS_B, **kw)
@@ -200,10 +189,6 @@ class SignalProcessingSettings(tk.LabelFrame):
 
         self.apply_slope_max = tk.BooleanVar(value=False)
         self.max_slope_percent = tk.DoubleVar(value=2)
-
-        #self.apply_filter_signal = tk.BooleanVar(value=False)
-        #self.low_pass_cutoff = tk.DoubleVar(value=1e6)
-        #self.high_pass_cutoff = tk.DoubleVar(value=0)
 
         tk.Checkbutton(self, text="Apply baseline", variable=self.apply_baseline,
                        bg=PANEL, fg=FG, selectcolor=ENTRY_BG,
@@ -248,20 +233,17 @@ class SignalProcessingSettings(tk.LabelFrame):
 
 
 # ---------------------------------------------------------------------------
-# Acquisition worker (runs in a background thread)
+# Ultra-low deadtime acquisition worker (Zero calculation overhead)
 # ---------------------------------------------------------------------------
 
 class AcqWorker:
     """
-    Background thread that calls analog_in_capture in a loop, applies 
-    signal processing configuration, and posts results to a queue.
+    Background thread optimized for raw hardware polling speed. 
+    Applies zero math transformations to maximize capture throughput.
     """
-
-    def __init__(self, ads: WaveFormsADS, params: dict, signal_params: dict,
-                 result_q: queue.Queue):
+    def __init__(self, ads: WaveFormsADS, params: dict, result_q: queue.Queue):
         self._ads    = ads
         self._params = params
-        self._sig_p  = signal_params
         self._q      = result_q
         self._stop   = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -274,7 +256,6 @@ class AcqWorker:
 
     def _run(self):
         p = self._params
-        s = self._sig_p
         ch    = p["channel"]
         fs    = p["sample_rate"]
         buf   = p["buffer_size"]
@@ -291,6 +272,7 @@ class AcqWorker:
 
         while not self._stop.is_set():
             try:
+                # Blocks only for hardware window, instantly yields execution back to re-arm
                 trace = self._ads.analog_in_capture(
                     channel=ch,
                     sample_rate_hz=fs,
@@ -301,50 +283,7 @@ class AcqWorker:
                     auto_timeout_s=0.0,
                     timeout_s=3.0,
                 )
-                
-                # --- Background Signal Processing ---
-                if s["apply_baseline"]:
-                    max_val = np.max(trace)
-                    if max_val == 0:
-                        max_val = 1e-6  # Prevent division by zero
-                        
-                    max_index = np.argmax(trace)
-                    stop_index = max(int(max_index - (s["position"] * fs)), 0)
-                    start_index = max(int(stop_index - (s["size"] * fs)), 0)
-                    
-                    if start_index >= stop_index:
-                        continue  # Not enough data points to compute baseline; reject event
-                        
-                    noise = np.std(trace[start_index:stop_index])
-
-                    # Scale raw fraction to percentages for dynamic UI fields
-                    if (noise / max_val) > (s["max_noise_percent"] / 100.0):
-                        continue  # Rejected due to excessive noise
-                    
-                    mid_index = start_index + (stop_index - start_index) // 2
-                    baseline_section_one = trace[start_index:mid_index]
-                    if len(baseline_section_one) == 0:
-                        continue
-                    y_offset = np.mean(baseline_section_one)
-                    
-                    baseline_section_two = trace[mid_index:stop_index]
-                    if len(baseline_section_two) == 0:
-                        continue
-                        
-                    denom = stop_index - start_index
-                    slope_val = (np.mean(baseline_section_two) - y_offset) / denom if denom != 0 else 0
-
-                    if s["apply_slope_max"]:
-                        if (slope_val / max_val) > (s["max_slope_percent"] / 100.0):
-                            continue  # Rejected due to baseline drift slope limit
-                    
-                    # Apply baseline correction across whole trace
-                    time_indices = np.arange(len(trace))
-                    true_baseline = slope_val * (time_indices - start_index) + y_offset
-                    trace = trace - true_baseline
-                
                 self._q.put(trace)
-                
             except TimeoutError:
                 pass
             except Exception as exc:
@@ -357,15 +296,15 @@ class AcqWorker:
 # ---------------------------------------------------------------------------
 
 class ScopeTab(tk.Frame):
-
     def __init__(self, parent, status_var: tk.StringVar, **kw):
         super().__init__(parent, bg=BG, **kw)
         self._status = status_var
         self._worker: AcqWorker | None = None
         self._ads:    WaveFormsADS | None = None
-        self._q:      queue.Queue = queue.Queue(maxsize=20)
+        self._q:      queue.Queue = queue.Queue(maxsize=50)
         self._traces: list = []
         self._running = False
+        self._time_indices = None
         self._build()
 
     def _build(self):
@@ -433,8 +372,12 @@ class ScopeTab(tk.Frame):
         self._params = self.scope_settings.get_params()
         self._signal_params = self.signal_processing_settings.get_params()
         self._max_traces = self.pulses_display.get()
-        self._q      = queue.Queue(maxsize=20)
-        self._worker = AcqWorker(self._ads, self._params, self._signal_params, self._q)
+        
+        # Action 2 Optimization: Allocate time index array tracking workspace once 
+        self._time_indices = np.arange(self._params["buffer_size"])
+        
+        self._q      = queue.Queue(maxsize=50)
+        self._worker = AcqWorker(self._ads, self._params, self._q)
         self._worker.start()
         self._running = True
         self._start_btn.configure(state="disabled")
@@ -468,10 +411,57 @@ class ScopeTab(tk.Frame):
                 self._status.set(f"Error: {item}")
                 self._stop()
                 return
-            self._add_trace(item)
+            
+            # Math transformations are decoupled entirely from the background worker thread
+            processed_item = self._process_trace(item)
+            if processed_item is not None:
+                self._add_trace(processed_item)
         except queue.Empty:
             pass
-        self.after(50, self._poll)
+        self.after(30, self._poll)
+
+    def _process_trace(self, trace: np.ndarray) -> np.ndarray | None:
+        s = self._signal_params
+        if not s["apply_baseline"]:
+            return trace
+            
+        max_val = np.max(trace)
+        if max_val == 0: 
+            max_val = 1e-6
+            
+        fs = self._params["sample_rate"]
+        max_index = np.argmax(trace)
+        stop_index = max(int(max_index - (s["position"] * fs)), 0)
+        start_index = max(int(stop_index - (s["size"] * fs)), 0)
+        
+        if start_index >= stop_index:
+            return None
+            
+        # Optimization: Use lightweight NumPy pointer array views without deep memory allocation
+        noise = np.std(trace[start_index:stop_index])
+        if (noise / max_val) > (s["max_noise_percent"] / 100.0):
+            return None
+            
+        mid_index = start_index + (stop_index - start_index) // 2
+        baseline_section_one = trace[start_index:mid_index]
+        if len(baseline_section_one) == 0:
+            return None
+        y_offset = np.mean(baseline_section_one)
+        
+        baseline_section_two = trace[mid_index:stop_index]
+        if len(baseline_section_two) == 0:
+            return None
+            
+        denom = stop_index - start_index
+        slope_val = (np.mean(baseline_section_two) - y_offset) / denom if denom != 0 else 0
+
+        if s["apply_slope_max"]:
+            if (slope_val / max_val) > (s["max_slope_percent"] / 100.0):
+                return None
+        
+        # Optimization: Apply correction across pre-allocated index track templates
+        true_baseline = slope_val * (self._time_indices - start_index) + y_offset
+        return trace - true_baseline
 
     def _add_trace(self, data: np.ndarray):
         p  = self._params
@@ -520,19 +510,18 @@ class ScopeTab(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class HistogramTab(tk.Frame):
-
     def __init__(self, parent, status_var: tk.StringVar, **kw):
         super().__init__(parent, bg=BG, **kw)
         self._status  = status_var
         self._worker: AcqWorker | None = None
         self._ads:    WaveFormsADS | None = None
-        self._q:      queue.Queue  = queue.Queue(maxsize=200)
+        self._q:      queue.Queue  = queue.Queue(maxsize=500)
         self._heights: list[float] = []
         self._last_waveform: np.ndarray | None = None
         self._running = False
         self._csv_file = None
         self._csv_writer = None
-        self._pulse_redraw_pending = False
+        self._time_indices = None
         self._build()
 
     def _build(self):
@@ -662,8 +651,7 @@ class HistogramTab(tk.Frame):
             self._heights.extend(imported)
             n = len(self._heights)
             self._count_var.set(f"Events: {n}")
-            self._status.set(
-                f"Imported {len(imported)} events from {path.split('/')[-1]}  (total: {n})")
+            self._status.set(f"Imported {len(imported)} events from {path.split('/')[-1]} (total: {n})")
             self._redraw()
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
@@ -695,15 +683,20 @@ class HistogramTab(tk.Frame):
 
         self._params = self.scope_settings.get_params()
         self._signal_params = self.signal_processing_settings.get_params()
-        self._q      = queue.Queue(maxsize=200)
-        self._worker = AcqWorker(self._ads, self._params, self._signal_params, self._q)
+        
+        # Action 2 Optimization: Allocate matrix index tracking template once upfront
+        self._time_indices = np.arange(self._params["buffer_size"])
+        
+        self._q      = queue.Queue(maxsize=500)
+        self._worker = AcqWorker(self._ads, self._params, self._q)
         self._worker.start()
         self._running = True
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._status.set("Histogram running …")
+        
         self._poll()
-        self._schedule_pulse_redraw()
+        self._schedule_plots_refresh()
 
     def _stop(self):
         self._running = False
@@ -731,7 +724,12 @@ class HistogramTab(tk.Frame):
     def _poll(self):
         if not self._running:
             return
-        updated = False
+        
+        # Drain the fast queue completely to eliminate potential backend lockup
+        ts = None
+        if self._csv_writer:
+            ts = datetime.datetime.now().isoformat(timespec="milliseconds")
+
         while not self._q.empty():
             try:
                 item = self._q.get_nowait()
@@ -742,28 +740,70 @@ class HistogramTab(tk.Frame):
                 self._stop()
                 return
             
-            # The item payload is baseline-corrected (if checked) inside the worker thread
-            peak = float(np.max(item))
-            self._heights.append(peak)
-            self._last_waveform = item
-            if self._csv_writer:
-                ts = datetime.datetime.now().isoformat(timespec="milliseconds")
-                self._csv_writer.writerow([ts, f"{peak:.6f}"])
-                self._csv_file.flush()
-            updated = True
+            # Fast inline vector manipulation shifted entirely out of the background worker
+            processed = self._process_trace(item)
+            if processed is not None:
+                peak = float(np.max(processed))
+                self._heights.append(peak)
+                self._last_waveform = processed
+                
+                if self._csv_writer:
+                    self._csv_writer.writerow([ts, f"{peak:.6f}"])
 
-        if updated:
-            n = len(self._heights)
-            self._count_var.set(f"Events: {n}")
-            self._status.set(f"Histogram running … {n} events")
-            self._redraw()
+        if self._csv_writer:
+            self._csv_file.flush()
 
-        self.after(80, self._poll)
+        self._count_var.set(f"Events: {len(self._heights)}")
+        self.after(20, self._poll) # Fast poll cadence prevents hardware driver ring buffer dropouts
 
-    def _schedule_pulse_redraw(self):
-        self._redraw_pulse()
+    def _process_trace(self, trace: np.ndarray) -> np.ndarray | None:
+        s = self._signal_params
+        if not s["apply_baseline"]:
+            return trace
+            
+        max_val = np.max(trace)
+        if max_val == 0: 
+            max_val = 1e-6
+            
+        fs = self._params["sample_rate"]
+        max_index = np.argmax(trace)
+        stop_index = max(int(max_index - (s["position"] * fs)), 0)
+        start_index = max(int(stop_index - (s["size"] * fs)), 0)
+        
+        if start_index >= stop_index:
+            return None
+            
+        noise = np.std(trace[start_index:stop_index])
+        if (noise / max_val) > (s["max_noise_percent"] / 100.0):
+            return None
+            
+        mid_index = start_index + (stop_index - start_index) // 2
+        baseline_section_one = trace[start_index:mid_index]
+        if len(baseline_section_one) == 0:
+            return None
+        y_offset = np.mean(baseline_section_one)
+        
+        baseline_section_two = trace[mid_index:stop_index]
+        if len(baseline_section_two) == 0:
+            return None
+            
+        denom = stop_index - start_index
+        slope_val = (np.mean(baseline_section_two) - y_offset) / denom if denom != 0 else 0
+
+        if s["apply_slope_max"]:
+            if (slope_val / max_val) > (s["max_slope_percent"] / 100.0):
+                return None
+        
+        # Apply offset shift relative to preallocated array template view
+        true_baseline = slope_val * (self._time_indices - start_index) + y_offset
+        return trace - true_baseline
+
+    def _schedule_plots_refresh(self):
+        """Throttled GUI drawing separate from data capture."""
         if self._running:
-            self.after(500, self._schedule_pulse_redraw)
+            self._redraw()
+            self._redraw_pulse()
+            self.after(350, self._schedule_plots_refresh) # Limits layout engine workload to ~3 FPS
 
     def _redraw_pulse(self):
         p = self._params
@@ -824,7 +864,6 @@ class HistogramTab(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class PulseHeightAnalyzer(tk.Tk):
-
     def __init__(self):
         super().__init__()
         self.title("Pulse Height Analyzer")
