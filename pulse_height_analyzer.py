@@ -44,7 +44,7 @@ MPL_STYLE = {
     "axes.labelcolor":   FG,
     "xtick.color":       FG,
     "ytick.color":       FG,
-    "text.color":       FG,
+    "text.color":        FG,
     "grid.color":        "#585b70",
     "grid.alpha":        0.4,
     "lines.color":       ACCENT,
@@ -237,10 +237,6 @@ class SignalProcessingSettings(tk.LabelFrame):
 # ---------------------------------------------------------------------------
 
 class AcqWorker:
-    """
-    Background thread optimized for raw hardware polling speed. 
-    Applies zero math transformations to maximize capture throughput.
-    """
     def __init__(self, ads: WaveFormsADS, params: dict, result_q: queue.Queue):
         self._ads    = ads
         self._params = params
@@ -272,7 +268,6 @@ class AcqWorker:
 
         while not self._stop.is_set():
             try:
-                # Blocks only for hardware window, instantly yields execution back to re-arm
                 trace = self._ads.analog_in_capture(
                     channel=ch,
                     sample_rate_hz=fs,
@@ -301,10 +296,17 @@ class ScopeTab(tk.Frame):
         self._status = status_var
         self._worker: AcqWorker | None = None
         self._ads:    WaveFormsADS | None = None
-        self._q:      queue.Queue = queue.Queue(maxsize=50)
+        self._q:      queue.Queue = queue.Queue(maxsize=100)
         self._traces: list = []
         self._running = False
         self._time_indices = None
+        
+        # Diagnostics
+        self._start_time = 0.0
+        self._total_events = 0
+        self._last_drawn_events = 0
+        self._last_metrics_time = 0.0
+        
         self._build()
 
     def _build(self):
@@ -341,6 +343,17 @@ class ScopeTab(tk.Frame):
 
         _btn(ctrl, "Clear Traces", self._clear_traces, col=0, row=1, colspan=2)
 
+        # Performance Monitoring Indicators
+        stats_frm = tk.LabelFrame(left, text="Performance Monitor", bg=PANEL, fg=YELLOW, font=SANS_B)
+        stats_frm.pack(fill="x", padx=4, pady=4)
+        stats_frm.columnconfigure(1, weight=1)
+        
+        self._rate_var = tk.StringVar(value="Rate: 0.0 Hz")
+        self._dead_var = tk.StringVar(value="Deadtime: 0.0 %")
+        
+        tk.Label(stats_frm, textvariable=self._rate_var, bg=PANEL, fg=FG, font=SANS_B, anchor="w").grid(row=0, column=0, sticky="w", padx=PADX, pady=PADY)
+        tk.Label(stats_frm, textvariable=self._dead_var, bg=PANEL, fg=RED, font=SANS_B, anchor="w").grid(row=1, column=0, sticky="w", padx=PADX, pady=PADY)
+
         right = tk.Frame(self, bg=BG)
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
         right.rowconfigure(0, weight=1)
@@ -373,17 +386,24 @@ class ScopeTab(tk.Frame):
         self._signal_params = self.signal_processing_settings.get_params()
         self._max_traces = self.pulses_display.get()
         
-        # Action 2 Optimization: Allocate time index array tracking workspace once 
         self._time_indices = np.arange(self._params["buffer_size"])
         
-        self._q      = queue.Queue(maxsize=50)
+        # Reset Diagnostics
+        self._start_time = time.perf_counter()
+        self._last_metrics_time = self._start_time
+        self._total_events = 0
+        self._last_drawn_events = 0
+        
+        self._q      = queue.Queue(maxsize=100)
         self._worker = AcqWorker(self._ads, self._params, self._q)
         self._worker.start()
         self._running = True
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._status.set("Scope running …")
+        
         self._poll()
+        self._schedule_plots_refresh()
 
     def _stop(self):
         self._running = False
@@ -406,19 +426,20 @@ class ScopeTab(tk.Frame):
         if not self._running:
             return
         try:
-            item = self._q.get_nowait()
-            if isinstance(item, Exception):
-                self._status.set(f"Error: {item}")
-                self._stop()
-                return
-            
-            # Math transformations are decoupled entirely from the background worker thread
-            processed_item = self._process_trace(item)
-            if processed_item is not None:
-                self._add_trace(processed_item)
+            while not self._q.empty():
+                item = self._q.get_nowait()
+                if isinstance(item, Exception):
+                    self._status.set(f"Error: {item}")
+                    self._stop()
+                    return
+                
+                self._total_events += 1
+                processed_item = self._process_trace(item)
+                if processed_item is not None:
+                    self._add_trace(processed_item)
         except queue.Empty:
             pass
-        self.after(30, self._poll)
+        self.after(20, self._poll)
 
     def _process_trace(self, trace: np.ndarray) -> np.ndarray | None:
         s = self._signal_params
@@ -437,7 +458,6 @@ class ScopeTab(tk.Frame):
         if start_index >= stop_index:
             return None
             
-        # Optimization: Use lightweight NumPy pointer array views without deep memory allocation
         noise = np.std(trace[start_index:stop_index])
         if (noise / max_val) > (s["max_noise_percent"] / 100.0):
             return None
@@ -459,7 +479,6 @@ class ScopeTab(tk.Frame):
             if (slope_val / max_val) > (s["max_slope_percent"] / 100.0):
                 return None
         
-        # Optimization: Apply correction across pre-allocated index track templates
         true_baseline = slope_val * (self._time_indices - start_index) + y_offset
         return trace - true_baseline
 
@@ -470,9 +489,32 @@ class ScopeTab(tk.Frame):
         self._traces.append((t, data))
         if len(self._traces) > self._max_traces:
             self._traces.pop(0)
-        self._redraw(self._traces)
-        n = len(self._traces)
-        self._status.set(f"Scope: {n} trace{'s' if n != 1 else ''} shown")
+
+    def _schedule_plots_refresh(self):
+        if self._running:
+            self._redraw(self._traces)
+            self._update_performance_metrics()
+            self.after(350, self._schedule_plots_refresh)
+
+    def _update_performance_metrics(self):
+        now = time.perf_counter()
+        dt = now - self._last_metrics_time
+        if dt <= 0:
+            return
+            
+        # Calculate localized trigger count rate (Hz)
+        events_caught = self._total_events - self._last_drawn_events
+        current_rate = events_caught / dt
+        self._rate_var.set(f"Rate: {current_rate:.1f} Hz")
+        
+        # Calculate Deadtime percentage based on current hardware payload size
+        buffer_duration_s = self._params["buffer_size"] / self._params["sample_rate"]
+        live_time_s = events_caught * buffer_duration_s
+        dead_time_pct = max(0.0, min(100.0, ((dt - live_time_s) / dt) * 100.0))
+        self._dead_var.set(f"Deadtime: {dead_time_pct:.1f} %")
+        
+        self._last_drawn_events = self._total_events
+        self._last_metrics_time = now
 
     def _redraw(self, traces):
         p = self._params
@@ -491,12 +533,9 @@ class ScopeTab(tk.Frame):
             for i, (t, d) in enumerate(traces):
                 alpha = 0.4 + 0.6 * (i + 1) / len(traces)
                 self._ax.plot(t, d, color=self._colors[i % len(self._colors)],
-                              lw=1.2, alpha=alpha,
-                              label=f"T-{len(traces)-i}")
+                              lw=1.2, alpha=alpha)
             self._ax.axhline(p["trigger_level"], color=RED, lw=0.8,
                              linestyle="--", alpha=0.7, label="Trigger")
-            self._ax.legend(loc="upper right", facecolor=PANEL,
-                            labelcolor=FG, fontsize=8, framealpha=0.7)
 
         self._canvas.draw_idle()
 
@@ -515,13 +554,20 @@ class HistogramTab(tk.Frame):
         self._status  = status_var
         self._worker: AcqWorker | None = None
         self._ads:    WaveFormsADS | None = None
-        self._q:      queue.Queue  = queue.Queue(maxsize=500)
+        self._q:      queue.Queue  = queue.Queue(maxsize=1000)
         self._heights: list[float] = []
         self._last_waveform: np.ndarray | None = None
         self._running = False
         self._csv_file = None
         self._csv_writer = None
         self._time_indices = None
+        
+        # Diagnostics
+        self._start_time = 0.0
+        self._total_events = 0
+        self._last_drawn_events = 0
+        self._last_metrics_time = 0.0
+        
         self._build()
 
     def _build(self):
@@ -579,9 +625,18 @@ class HistogramTab(tk.Frame):
 
         _btn(ctrl, "Clear Histogram", self._clear_hist, col=0, row=1, colspan=2)
 
-        self._count_var = tk.StringVar(value="Events: 0")
-        tk.Label(left, textvariable=self._count_var,
-                 bg=BG, fg=YELLOW, font=SANS_B).pack(pady=4)
+        # Performance Monitoring Indicators
+        stats_frm = tk.LabelFrame(left, text="Performance Monitor", bg=PANEL, fg=YELLOW, font=SANS_B)
+        stats_frm.pack(fill="x", padx=4, pady=4)
+        stats_frm.columnconfigure(1, weight=1)
+        
+        self._rate_var = tk.StringVar(value="Rate: 0.0 Hz")
+        self._dead_var = tk.StringVar(value="Deadtime: 0.0 %")
+        self._count_var = tk.StringVar(value="Events logged: 0")
+        
+        tk.Label(stats_frm, textvariable=self._rate_var, bg=PANEL, fg=FG, font=SANS_B, anchor="w").grid(row=0, column=0, sticky="w", padx=PADX, pady=PADY)
+        tk.Label(stats_frm, textvariable=self._dead_var, bg=PANEL, fg=RED, font=SANS_B, anchor="w").grid(row=1, column=0, sticky="w", padx=PADX, pady=PADY)
+        tk.Label(stats_frm, textvariable=self._count_var, bg=PANEL, fg=YELLOW, font=SANS_B, anchor="w").grid(row=2, column=0, sticky="w", padx=PADX, pady=PADY)
 
         right = tk.Frame(self, bg=BG)
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
@@ -613,7 +668,7 @@ class HistogramTab(tk.Frame):
         self._pcanvas.draw()
 
     def _browse_file(self):
-        path = filedialog.asksaveasfilename(
+        path = filedialog.asksavesasfilename(
             title="Save pulse heights to CSV",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
@@ -649,9 +704,7 @@ class HistogramTab(tk.Frame):
                 messagebox.showwarning("Import", "No numeric pulse-height values found in file.")
                 return
             self._heights.extend(imported)
-            n = len(self._heights)
-            self._count_var.set(f"Events: {n}")
-            self._status.set(f"Imported {len(imported)} events from {path.split('/')[-1]} (total: {n})")
+            self._count_var.set(f"Events logged: {len(self._heights)}")
             self._redraw()
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
@@ -684,10 +737,15 @@ class HistogramTab(tk.Frame):
         self._params = self.scope_settings.get_params()
         self._signal_params = self.signal_processing_settings.get_params()
         
-        # Action 2 Optimization: Allocate matrix index tracking template once upfront
         self._time_indices = np.arange(self._params["buffer_size"])
         
-        self._q      = queue.Queue(maxsize=500)
+        # Reset Diagnostics
+        self._start_time = time.perf_counter()
+        self._last_metrics_time = self._start_time
+        self._total_events = 0
+        self._last_drawn_events = 0
+        
+        self._q      = queue.Queue(maxsize=1000)
         self._worker = AcqWorker(self._ads, self._params, self._q)
         self._worker.start()
         self._running = True
@@ -718,14 +776,13 @@ class HistogramTab(tk.Frame):
 
     def _clear_hist(self):
         self._heights.clear()
-        self._count_var.set("Events: 0")
+        self._count_var.set("Events logged: 0")
         self._redraw()
 
     def _poll(self):
         if not self._running:
             return
         
-        # Drain the fast queue completely to eliminate potential backend lockup
         ts = None
         if self._csv_writer:
             ts = datetime.datetime.now().isoformat(timespec="milliseconds")
@@ -740,7 +797,7 @@ class HistogramTab(tk.Frame):
                 self._stop()
                 return
             
-            # Fast inline vector manipulation shifted entirely out of the background worker
+            self._total_events += 1
             processed = self._process_trace(item)
             if processed is not None:
                 peak = float(np.max(processed))
@@ -753,8 +810,7 @@ class HistogramTab(tk.Frame):
         if self._csv_writer:
             self._csv_file.flush()
 
-        self._count_var.set(f"Events: {len(self._heights)}")
-        self.after(20, self._poll) # Fast poll cadence prevents hardware driver ring buffer dropouts
+        self.after(20, self._poll)
 
     def _process_trace(self, trace: np.ndarray) -> np.ndarray | None:
         s = self._signal_params
@@ -794,16 +850,38 @@ class HistogramTab(tk.Frame):
             if (slope_val / max_val) > (s["max_slope_percent"] / 100.0):
                 return None
         
-        # Apply offset shift relative to preallocated array template view
         true_baseline = slope_val * (self._time_indices - start_index) + y_offset
         return trace - true_baseline
 
     def _schedule_plots_refresh(self):
-        """Throttled GUI drawing separate from data capture."""
         if self._running:
             self._redraw()
             self._redraw_pulse()
-            self.after(350, self._schedule_plots_refresh) # Limits layout engine workload to ~3 FPS
+            self._update_performance_metrics()
+            self.after(350, self._schedule_plots_refresh)
+
+    def _update_performance_metrics(self):
+        now = time.perf_counter()
+        dt = now - self._last_metrics_time
+        if dt <= 0:
+            return
+            
+        # Calculate pulse capture frequency
+        events_caught = self._total_events - self._last_drawn_events
+        current_rate = events_caught / dt
+        self._rate_var.set(f"Rate: {current_rate:.1f} Hz")
+        
+        # Calculate Deadtime percentage based on current hardware payload size
+        buffer_duration_s = self._params["buffer_size"] / self._params["sample_rate"]
+        live_time_s = events_caught * buffer_duration_s
+        dead_time_pct = max(0.0, min(100.0, ((dt - live_time_s) / dt) * 100.0))
+        self._dead_var.set(f"Deadtime: {dead_time_pct:.1f} %")
+        
+        self._count_var.set(f"Events logged: {len(self._heights)}")
+        self._status.set(f"Histogram running … {len(self._heights)} events")
+        
+        self._last_drawn_events = self._total_events
+        self._last_metrics_time = now
 
     def _redraw_pulse(self):
         p = self._params
