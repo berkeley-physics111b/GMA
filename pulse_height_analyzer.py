@@ -268,6 +268,7 @@ class AcqWorker:
 
         while not self._stop.is_set():
             try:
+                t0 = time.perf_counter()
                 trace = self._ads.analog_in_capture(
                     channel=ch,
                     sample_rate_hz=fs,
@@ -278,11 +279,20 @@ class AcqWorker:
                     auto_timeout_s=0.0,
                     timeout_s=3.0,
                 )
-                self._q.put(trace)
+                cap_dur = time.perf_counter() - t0
+                ts = datetime.datetime.now().isoformat(timespec="milliseconds")
+                # Non-blocking put: drop the event rather than stalling acquisition
+                try:
+                    self._q.put((trace, ts, cap_dur), block=False)
+                except queue.Full:
+                    pass
             except TimeoutError:
                 pass
             except Exception as exc:
-                self._q.put(exc)
+                try:
+                    self._q.put(exc, block=False)
+                except queue.Full:
+                    pass
                 break
 
 
@@ -306,6 +316,13 @@ class ScopeTab(tk.Frame):
         self._total_events = 0
         self._last_drawn_events = 0
         self._last_metrics_time = 0.0
+        self._total_capture_s = 0.0   # accumulated measured busy time
+        self._last_capture_s  = 0.0   # snapshot at last metrics update
+
+        # Persistent matplotlib artists (created in _start)
+        self._trace_lines: list = []
+        self._trigger_line = None
+        self._last_scope_ax_key = None
         
         self._build()
 
@@ -388,11 +405,30 @@ class ScopeTab(tk.Frame):
         
         self._time_indices = np.arange(self._params["buffer_size"])
         
-        # Reset Diagnostics
+        # Reset diagnostics
         self._start_time = time.perf_counter()
         self._last_metrics_time = self._start_time
         self._total_events = 0
         self._last_drawn_events = 0
+        self._total_capture_s = 0.0
+        self._last_capture_s  = 0.0
+
+        # (Re-)create persistent line artists so count matches max_traces
+        for ln in self._trace_lines:
+            try: ln.remove()
+            except Exception: pass
+        if self._trigger_line is not None:
+            try: self._trigger_line.remove()
+            except Exception: pass
+        self._trace_lines = [
+            self._ax.plot([], [], lw=1.2, visible=False)[0]
+            for _ in range(self._max_traces)
+        ]
+        self._trigger_line = self._ax.axhline(
+            self._params["trigger_level"], color=RED,
+            lw=0.8, linestyle="--", alpha=0.7, visible=False,
+        )
+        self._last_scope_ax_key = None
         
         self._q      = queue.Queue(maxsize=100)
         self._worker = AcqWorker(self._ads, self._params, self._q)
@@ -420,7 +456,11 @@ class ScopeTab(tk.Frame):
 
     def _clear_traces(self):
         self._traces.clear()
-        self._redraw([])
+        for ln in self._trace_lines:
+            ln.set_visible(False)
+        if self._trigger_line is not None:
+            self._trigger_line.set_visible(False)
+        self._canvas.draw_idle()
 
     def _poll(self):
         if not self._running:
@@ -433,8 +473,10 @@ class ScopeTab(tk.Frame):
                     self._stop()
                     return
                 
+                trace, _ts, cap_dur = item
                 self._total_events += 1
-                processed_item = self._process_trace(item)
+                self._total_capture_s += cap_dur
+                processed_item = self._process_trace(trace)
                 if processed_item is not None:
                     self._add_trace(processed_item)
         except queue.Empty:
@@ -502,40 +544,55 @@ class ScopeTab(tk.Frame):
         if dt <= 0:
             return
             
-        # Calculate localized trigger count rate (Hz)
+        # Localized trigger count rate (Hz)
         events_caught = self._total_events - self._last_drawn_events
         current_rate = events_caught / dt
         self._rate_var.set(f"Rate: {current_rate:.1f} Hz")
         
-        # Calculate Deadtime percentage based on current hardware payload size
-        buffer_duration_s = self._params["buffer_size"] / self._params["sample_rate"]
-        dead_time_s = events_caught * buffer_duration_s
-        dead_time_pct = max(0.0, min(100.0, (dead_time_s / dt) * 100.0))
+        # Deadtime = fraction of time the digitizer was busy capturing/transferring.
+        # Each capture call blocks for cap_dur seconds (measured in _run), so
+        # dead_time = sum(cap_dur) / elapsed.  This is the standard non-paralyzable
+        # dead-time model: D → 100 % as rate → 1/τ where τ = mean cap_dur.
+        capture_s = self._total_capture_s - self._last_capture_s
+        dead_time_pct = max(0.0, min(100.0, (capture_s / dt) * 100.0))
         self._dead_var.set(f"Deadtime: {dead_time_pct:.1f} %")
         
         self._last_drawn_events = self._total_events
+        self._last_capture_s    = self._total_capture_s
         self._last_metrics_time = now
 
     def _redraw(self, traces):
         p = self._params
-        y_range = p["y_range"]
+        y_range   = p["y_range"]
         time_base = p["time_base_us"]
-        self._ax.cla()
-        self._ax.set_xlim(-time_base / 2, time_base / 2)
-        self._ax.set_ylim(-y_range / 2, y_range / 2)
-        self._ax.set_facecolor(PANEL)
-        self._ax.set_xlabel("Time (μs)", color=FG)
-        self._ax.set_ylabel("Voltage (V)", color=FG)
-        self._ax.set_title("Scope - Recent Pulses", color=ACCENT)
-        self._ax.grid(True)
 
-        if traces:
-            for i, (t, d) in enumerate(traces):
-                alpha = 0.4 + 0.6 * (i + 1) / len(traces)
-                self._ax.plot(t, d, color=self._colors[i % len(self._colors)],
-                              lw=1.2, alpha=alpha)
-            self._ax.axhline(p["trigger_level"], color=RED, lw=0.8,
-                             linestyle="--", alpha=0.7, label="Trigger")
+        # Only touch xlim/ylim when the relevant params actually change
+        ax_key = (y_range, time_base)
+        if ax_key != self._last_scope_ax_key:
+            self._ax.set_xlim(-time_base / 2, time_base / 2)
+            self._ax.set_ylim(-y_range / 2, y_range / 2)
+            self._last_scope_ax_key = ax_key
+
+        if not self._trace_lines:
+            # Artists not created yet (before first _start)
+            self._canvas.draw_idle()
+            return
+
+        n = len(traces)
+        for i, ln in enumerate(self._trace_lines):
+            if i < n:
+                t, d  = traces[i]
+                alpha = 0.4 + 0.6 * (i + 1) / n
+                ln.set_data(t, d)
+                ln.set_alpha(alpha)
+                ln.set_color(self._colors[i % len(self._colors)])
+                ln.set_visible(True)
+            else:
+                ln.set_visible(False)
+
+        if self._trigger_line is not None:
+            self._trigger_line.set_ydata([p["trigger_level"], p["trigger_level"]])
+            self._trigger_line.set_visible(bool(traces))
 
         self._canvas.draw_idle()
 
@@ -567,6 +624,20 @@ class HistogramTab(tk.Frame):
         self._total_events = 0
         self._last_drawn_events = 0
         self._last_metrics_time = 0.0
+        self._total_capture_s = 0.0   # accumulated measured busy time
+        self._last_capture_s  = 0.0   # snapshot at last metrics update
+
+        # Incremental histogram state
+        self._hist_counts: np.ndarray | None = None
+        self._hist_edges:  np.ndarray | None = None
+        self._last_hist_idx: int = 0
+
+        # Persistent matplotlib artists
+        self._bar_container = None
+        self._last_hist_ax_key = None
+        self._pulse_line = None
+        self._pulse_trig_line = None
+        self._last_pulse_ax_key = None
         
         self._build()
 
@@ -663,6 +734,11 @@ class HistogramTab(tk.Frame):
         self._pax.set_ylabel("V", color=FG)
         self._pax.set_title("Most Recent Pulse", color=ACCENT)
         self._pax.grid(True)
+        # Persistent artists for pulse plot (data set when a waveform arrives)
+        self._pulse_line, = self._pax.plot([], [], color=GREEN, lw=1.2)
+        self._pulse_trig_line = self._pax.axhline(
+            0, color=RED, lw=0.8, linestyle="--", alpha=0.7, visible=False
+        )
         self._pcanvas = FigureCanvasTkAgg(self._pfig, master=right)
         self._pcanvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
         self._pcanvas.draw()
@@ -704,6 +780,10 @@ class HistogramTab(tk.Frame):
                 messagebox.showwarning("Import", "No numeric pulse-height values found in file.")
                 return
             self._heights.extend(imported)
+            # Force full recompute on next redraw since we added unseen data
+            self._hist_counts   = None
+            self._hist_edges    = None
+            self._last_hist_idx = 0
             self._count_var.set(f"Events logged: {len(self._heights)}")
             self._redraw()
         except Exception as exc:
@@ -739,11 +819,26 @@ class HistogramTab(tk.Frame):
         
         self._time_indices = np.arange(self._params["buffer_size"])
         
-        # Reset Diagnostics
+        # Reset diagnostics
         self._start_time = time.perf_counter()
         self._last_metrics_time = self._start_time
         self._total_events = 0
         self._last_drawn_events = 0
+        self._total_capture_s = 0.0
+        self._last_capture_s  = 0.0
+
+        # Reset incremental histogram state
+        self._hist_counts    = None
+        self._hist_edges     = None
+        self._last_hist_idx  = 0
+
+        # Initialise pulse axes to current params
+        p = self._params
+        self._pax.set_xlim(-p["time_base_us"] / 2,  p["time_base_us"] / 2)
+        self._pax.set_ylim(-p["y_range"] / 2,        p["y_range"] / 2)
+        self._pulse_trig_line.set_ydata([p["trigger_level"], p["trigger_level"]])
+        self._pulse_trig_line.set_visible(False)
+        self._last_pulse_ax_key = (p["y_range"], p["time_base_us"], p["trigger_level"])
         
         self._q      = queue.Queue(maxsize=1000)
         self._worker = AcqWorker(self._ads, self._params, self._q)
@@ -776,18 +871,22 @@ class HistogramTab(tk.Frame):
 
     def _clear_hist(self):
         self._heights.clear()
+        self._hist_counts   = None
+        self._hist_edges    = None
+        self._last_hist_idx = 0
+        if self._bar_container is not None:
+            self._bar_container.remove()
+            self._bar_container = None
+        self._last_hist_ax_key = None
         self._count_var.set("Events logged: 0")
-        self._redraw()
+        self._canvas.draw_idle()
 
     def _poll(self):
         if not self._running:
             return
         
-        ts = None
-        if self._csv_writer:
-            ts = datetime.datetime.now().isoformat(timespec="milliseconds")
-
-        while not self._q.empty():
+        rows_written = 0
+        while True:
             try:
                 item = self._q.get_nowait()
             except queue.Empty:
@@ -797,8 +896,10 @@ class HistogramTab(tk.Frame):
                 self._stop()
                 return
             
-            self._total_events += 1
-            processed = self._process_trace(item)
+            trace, ts, cap_dur = item
+            self._total_events   += 1
+            self._total_capture_s += cap_dur
+            processed = self._process_trace(trace)
             if processed is not None:
                 peak = float(np.max(processed))
                 self._heights.append(peak)
@@ -806,8 +907,10 @@ class HistogramTab(tk.Frame):
                 
                 if self._csv_writer:
                     self._csv_writer.writerow([ts, f"{peak:.6f}"])
+                    rows_written += 1
 
-        if self._csv_writer:
+        # Flush only when something was actually written (avoids 50 syscalls/s idle)
+        if self._csv_writer and rows_written > 0:
             self._csv_file.flush()
 
         self.after(20, self._poll)
@@ -866,69 +969,101 @@ class HistogramTab(tk.Frame):
         if dt <= 0:
             return
             
-        # Calculate pulse capture frequency
+        # Localized trigger count rate (Hz)
         events_caught = self._total_events - self._last_drawn_events
         current_rate = events_caught / dt
         self._rate_var.set(f"Rate: {current_rate:.1f} Hz")
         
-        # Calculate Deadtime percentage based on current hardware payload size
-        buffer_duration_s = self._params["buffer_size"] / self._params["sample_rate"]
-        dead_time_s = events_caught * buffer_duration_s
-        dead_time_pct = max(0.0, min(100.0, (dead_time_s / dt) * 100.0))
+        # Deadtime = fraction of time the digitizer was busy capturing/transferring.
+        capture_s = self._total_capture_s - self._last_capture_s
+        dead_time_pct = max(0.0, min(100.0, (capture_s / dt) * 100.0))
         self._dead_var.set(f"Deadtime: {dead_time_pct:.1f} %")
         
         self._count_var.set(f"Events logged: {len(self._heights)}")
         self._status.set(f"Histogram running … {len(self._heights)} events")
         
         self._last_drawn_events = self._total_events
+        self._last_capture_s    = self._total_capture_s
         self._last_metrics_time = now
 
     def _redraw_pulse(self):
         p = self._params
-        y_range = p["y_range"]
-        time_base = p["time_base_us"]
-        self._pax.cla()
-        self._pax.set_xlim(-time_base / 2, time_base / 2)
-        self._pax.set_ylim(-y_range / 2, y_range / 2)
-        self._pax.set_facecolor(PANEL)
-        self._pax.set_xlabel("Time (μs)", color=FG)
-        self._pax.set_ylabel("V", color=FG)
-        self._pax.set_title("Most Recent Pulse", color=ACCENT)
-        self._pax.grid(True)
+        ax_key = (p["y_range"], p["time_base_us"], p["trigger_level"])
+        if ax_key != self._last_pulse_ax_key:
+            self._pax.set_xlim(-p["time_base_us"] / 2, p["time_base_us"] / 2)
+            self._pax.set_ylim(-p["y_range"] / 2,      p["y_range"] / 2)
+            self._pulse_trig_line.set_ydata([p["trigger_level"], p["trigger_level"]])
+            self._last_pulse_ax_key = ax_key
+
         if self._last_waveform is not None:
             fs = p["sample_rate"]
-            t  = np.linspace(-len(self._last_waveform) / (2*fs) * 1e6, 
-                             len(self._last_waveform) / (2*fs) * 1e6,
-                             len(self._last_waveform))
-            self._pax.plot(t, self._last_waveform, color=GREEN, lw=1.2)
-            self._pax.axhline(p["trigger_level"], color=RED,
-                              lw=0.8, linestyle="--", alpha=0.7)
+            t  = np.linspace(-len(self._last_waveform) / (2 * fs) * 1e6,
+                              len(self._last_waveform) / (2 * fs) * 1e6,
+                              len(self._last_waveform))
+            self._pulse_line.set_data(t, self._last_waveform)
+            self._pulse_line.set_visible(True)
+            self._pulse_trig_line.set_visible(True)
+        else:
+            self._pulse_line.set_data([], [])
+            self._pulse_trig_line.set_visible(False)
+
         self._pcanvas.draw_idle()
 
     def _redraw(self):
-        self._ax.cla()
-        self._ax.set_facecolor(PANEL)
-        self._ax.set_xlabel("Pulse Height (V)", color=FG)
-        self._ax.set_ylabel("Counts", color=FG)
-        self._ax.set_title("Pulse-Height Histogram", color=ACCENT)
-        self._ax.grid(True)
+        if not self._heights:
+            if self._bar_container is not None:
+                self._bar_container.remove()
+                self._bar_container = None
+                self._last_hist_ax_key = None
+            self._canvas.draw_idle()
+            return
 
-        if self._heights:
-            try:
-                bins  = max(2, int(self.n_bins.get()))
-                vmin  = float(self.v_min.get())
-                vmax  = float(self.v_max.get())
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
-                edges = np.linspace(vmin, vmax, bins + 1)
-                counts, _ = np.histogram(self._heights, bins=edges)
-                centers    = 0.5 * (edges[:-1] + edges[1:])
-                width      = edges[1] - edges[0]
-                self._ax.bar(centers, counts, width=width * 0.92,
-                             color=ACCENT, edgecolor=PANEL, linewidth=0.4,
-                             alpha=0.85)
-            except (ValueError, tk.TclError):
-                pass
+        try:
+            bins = max(2, int(self.n_bins.get()))
+            vmin = float(self.v_min.get())
+            vmax = float(self.v_max.get())
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+        except (ValueError, tk.TclError):
+            return
+
+        edges  = np.linspace(vmin, vmax, bins + 1)
+        ax_key = (bins, vmin, vmax)
+
+        if not np.array_equal(edges, self._hist_edges):
+            # Bins or range changed: full recompute, recreate bars
+            counts, _ = np.histogram(self._heights, bins=edges)
+            self._hist_counts   = counts
+            self._hist_edges    = edges
+            self._last_hist_idx = len(self._heights)
+            if self._bar_container is not None:
+                self._bar_container.remove()
+                self._bar_container = None
+        else:
+            # Only bin the events added since the last redraw
+            new_counts, _ = np.histogram(
+                self._heights[self._last_hist_idx:], bins=edges)
+            self._hist_counts   += new_counts
+            self._last_hist_idx  = len(self._heights)
+
+        counts  = self._hist_counts
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        width   = edges[1] - edges[0]
+
+        if self._bar_container is None:
+            # Create bar artists and set x-axis range
+            self._bar_container = self._ax.bar(
+                centers, counts, width=width * 0.92,
+                color=ACCENT, edgecolor=PANEL, linewidth=0.4, alpha=0.85,
+            )
+            self._ax.set_xlim(vmin, vmax)
+            self._last_hist_ax_key = ax_key
+        else:
+            # Fast path: update bar heights in-place
+            for rect, h in zip(self._bar_container.patches, counts):
+                rect.set_height(h)
+            # Rescale y-axis to fit new tallest bar
+            self._ax.set_ylim(0, max(counts.max() * 1.05, 1))
 
         self._canvas.draw_idle()
 
