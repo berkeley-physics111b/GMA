@@ -509,8 +509,8 @@ class ScopeTab(tk.Frame):
         
         # Calculate Deadtime percentage based on current hardware payload size
         buffer_duration_s = self._params["buffer_size"] / self._params["sample_rate"]
-        live_time_s = events_caught * buffer_duration_s
-        dead_time_pct = max(0.0, min(100.0, ((dt - live_time_s) / dt) * 100.0))
+        dead_time_s = events_caught * buffer_duration_s
+        dead_time_pct = max(0.0, min(100.0, (dead_time_s / dt) * 100.0))
         self._dead_var.set(f"Deadtime: {dead_time_pct:.1f} %")
         
         self._last_drawn_events = self._total_events
@@ -873,8 +873,8 @@ class HistogramTab(tk.Frame):
         
         # Calculate Deadtime percentage based on current hardware payload size
         buffer_duration_s = self._params["buffer_size"] / self._params["sample_rate"]
-        live_time_s = events_caught * buffer_duration_s
-        dead_time_pct = max(0.0, min(100.0, ((dt - live_time_s) / dt) * 100.0))
+        dead_time_s = events_caught * buffer_duration_s
+        dead_time_pct = max(0.0, min(100.0, (dead_time_s / dt) * 100.0))
         self._dead_var.set(f"Deadtime: {dead_time_pct:.1f} %")
         
         self._count_var.set(f"Events logged: {len(self._heights)}")
